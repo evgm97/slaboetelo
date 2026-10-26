@@ -1,0 +1,48 @@
+Настройка Telegram-уведомлений для «Слабое тело»
+
+Этот релиз добавляет обработчик webhook в Node-сервер. Для работы нужны токен существующего бота и webhook secret. Не отправляй их в чат и не помещай в архив с исходниками.
+
+Подготовка после установки обновления
+1. Убедись, что сайт открывается по HTTPS: https://slaboetelo.ru.
+2. На сервере создай закрытый файл окружения:
+
+install -d -m 700 /etc/slaboetelo
+nano /etc/slaboetelo/telegram.env
+
+Содержимое файла (секреты вводятся прямо в редакторе на сервере):
+
+RITM_TELEGRAM_BOT_TOKEN=ТОКЕН_ИЗ_BOTFATHER
+RITM_TELEGRAM_WEBHOOK_SECRET=СЛУЧАЙНЫЙ_СЕКРЕТ
+RITM_TELEGRAM_BOT_USERNAME=SlaboeTeloFitnessBot
+RITM_PUBLIC_URL=https://slaboetelo.ru
+
+Для webhook secret создай случайную строку командой `openssl rand -hex 32` и вставь её в файл. Не публикуй вывод этой команды. Установи права:
+
+chmod 600 /etc/slaboetelo/telegram.env
+
+3. Подключи файл к существующей systemd-службе, не заменяя её параметры:
+
+mkdir -p /etc/systemd/system/slaboetelo.service.d
+cat > /etc/systemd/system/slaboetelo.service.d/telegram.conf <<'EOF'
+[Service]
+EnvironmentFile=/etc/slaboetelo/telegram.env
+EOF
+systemctl daemon-reload
+systemctl restart slaboetelo
+
+4. Настрой webhook из каталога активного релиза:
+
+node /opt/slaboetelo/releases/20261022/deploy/configure-telegram-webhook.mjs --env-file /etc/slaboetelo/telegram.env
+
+   Скрипт сначала проверяет текущий webhook. Если у бота уже задан другой адрес, он остановится без изменений. Не используй `--replace-existing`, пока не проверишь и не решишь, что старую интеграцию можно заменить.
+
+Проверка пользователем
+1. Открой @SlaboeTeloFitnessBot и отправь `/start`.
+2. В приложении открой «Ещё» → «Настройки приложения» → «Уведомления в Telegram».
+3. Нажми «Привязать Telegram», открой одноразовую ссылку, отправь `/start` в боте и вернись в приложение.
+4. Выбери категории, включи общий переключатель и сохрани.
+5. Проверь реальное событие приложения, например сообщение тренера. При блокировке/остановке бота отправь `/start`; `/stop` выключает все категории.
+
+Уведомления содержат только нейтральное название события. Текст переписки, записи питания, цели КБЖУ, вес, замеры и данные профиля в Telegram не отправляются. Сообщения о таймере отдыха, напоминания о расписании и приёмах пищи в этом этапе не реализованы.
+
+Откат кода не меняет сохранённые связи Telegram или настройки пользователей. Чтобы отключить отправку на сервере, удали Telegram EnvironmentFile из systemd drop-in, выполни `systemctl daemon-reload` и перезапусти slaboetelo. Для полного отвязывания пользователь использует «Отключить Telegram» в приложении.
