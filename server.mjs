@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
-import { randomBytes, randomUUID, createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, createHash, createHmac, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { readFile, writeFile, rename, mkdir, unlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,8 +22,14 @@ const sessionMaxAge = 30 * 24 * 60 * 60 * 1000;
 const maxBodyBytes = 2 * 1024 * 1024;
 const openFoodFactsUserAgent = (process.env.RITM_OFF_USER_AGENT || 'SlaboeTelo/1.0 (http://localhost:8766)').slice(0, 200);
 const adminLogin = String(process.env.RITM_ADMIN_LOGIN || '').trim().toLowerCase();
-const telegramBotToken = String(process.env.RITM_TELEGRAM_BOT_TOKEN || '').trim();
 const telegramWebhookSecret = String(process.env.RITM_TELEGRAM_WEBHOOK_SECRET || '').trim();
+const telegramRelaySecret = String(process.env.RITM_TELEGRAM_RELAY_SECRET || '').trim();
+const telegramRelayUrl = (() => {
+  try {
+    const value = new URL(String(process.env.RITM_TELEGRAM_RELAY_URL || '').trim());
+    return value.protocol === 'https:' && value.pathname === '/' && !value.search && !value.hash && !value.username && !value.password ? value.origin : '';
+  } catch { return ''; }
+})();
 const telegramBotUsernameInput = String(process.env.RITM_TELEGRAM_BOT_USERNAME || 'SlaboeTeloFitnessBot').trim().replace(/^@/, '');
 const telegramBotUsername = /^[A-Za-z0-9_]{5,32}$/.test(telegramBotUsernameInput) ? telegramBotUsernameInput : 'SlaboeTeloFitnessBot';
 const telegramPublicOrigin = String(process.env.RITM_PUBLIC_URL || 'https://slaboetelo.ru').trim().replace(/\/+$/, '');
@@ -32,8 +39,8 @@ const telegramPublicUrl = (() => {
     return value.protocol === 'https:' && value.pathname === '/' && !value.search && !value.hash ? value.origin : '';
   } catch { return ''; }
 })();
-const telegramConfigured = Boolean(telegramBotToken && telegramWebhookSecret && /^[A-Za-z0-9_-]{1,256}$/.test(telegramWebhookSecret) && telegramPublicUrl);
-const telegramWebhookUrl = telegramPublicUrl ? `${telegramPublicUrl}/api/telegram/webhook` : '';
+const telegramConfigured = Boolean(telegramRelayUrl && /^[a-f0-9]{64}$/i.test(telegramRelaySecret) && telegramWebhookSecret && /^[A-Za-z0-9_-]{1,256}$/.test(telegramWebhookSecret) && telegramPublicUrl);
+const telegramWebhookUrl = telegramRelayUrl ? `${telegramRelayUrl}/telegram-webhook` : '';
 const telegramCategories = ['coach', 'workouts', 'programs', 'nutrition', 'account'];
 const programNames = new Map(Object.entries({
   '01': 'Старт — всё тело', '02': 'Возвращение в форму', '03': 'Верх / низ — 3 дня', '04': 'Верх / низ — 4 дня',
@@ -44,12 +51,15 @@ const programNames = new Map(Object.entries({
 const openFoodFactsCache = new Map();
 const openFoodFactsRequests = { search: [], barcode: [] };
 const mimeTypes = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml' };
-const publicFiles = new Set(['/index.html', '/admin.html', '/program-library.js', '/coach.js', '/privacy.html']);
+const publicFiles = new Set(['/index.html', '/admin.html', '/program-library.js', '/exercise-techniques.js', '/coach.js', '/privacy.html']);
 const publicAssetExtensions = new Set(['.jpeg', '.jpg', '.png']);
+const publicAssetFiles = new Set(['/assets/exercise-french-press.svg', '/assets/exercise-deadlift.svg', '/assets/exercise-pull-up.svg', '/assets/exercise-step-up.svg']);
 
 let state;
 let nutritionCatalog = [];
+let libraryProgramsById = new Map();
 let exerciseNames = new Map([['legpress', 'Жим ногами'], ['bridge', 'Ягодичный мост'], ['lateral', 'Отведение гантелей в стороны'], ['treadmill', 'Ходьба на дорожке'], ['chestpress', 'Жим в тренажёре'], ['row', 'Тяга блока к поясу'], ['curl', 'Сгибание ног в тренажёре'], ['pulldown', 'Тяга верхнего блока']]);
+const timedExerciseIds = new Set(['treadmill']);
 let writeQueue = Promise.resolve();
 const attempts = new Map();
 const coachAttempts = new Map();
@@ -214,22 +224,59 @@ function normalizeAppSettings(input) {
 function normalizeData(input) {
   if (!plainObject(input)) throw new Error('Данные профиля имеют неверный формат');
   const profile = plainObject(input.profile) ? input.profile : {};
-  const customPrograms = Array.isArray(input.customPrograms) ? input.customPrograms.slice(0, 100).filter(plainObject).map(program => ({
-    id: typeof program.id === 'string' && /^cp-[0-9a-f-]{36}$/i.test(program.id) ? program.id : '',
-    name: String(program.name || '').trim().slice(0, 60),
-    description: String(program.description || '').trim().slice(0, 240),
-    schedule: typeof program.schedule === 'string' ? program.schedule.slice(0, 80) : '',
-    exerciseIds: Array.isArray(program.exerciseIds) ? [...new Set(program.exerciseIds.filter(id => typeof id === 'string').map(id => id.slice(0, 80)))].slice(0, 60) : [],
-    exerciseSpecs: Array.isArray(program.exerciseSpecs) ? program.exerciseSpecs.slice(0, 60).filter(plainObject).map(spec => ({ exerciseId: String(spec.exerciseId || '').slice(0, 80), sets: String(spec.sets || '3').slice(0, 12), reps: String(spec.reps || '8–12').slice(0, 20), rest: String(spec.rest || '90 сек').slice(0, 20) })) : []
-  })).filter(program => program.id && program.name && program.exerciseIds.length) : [];
+  const customPrograms = Array.isArray(input.customPrograms) ? input.customPrograms.slice(0, 100).filter(plainObject).map(program => {
+    const trainingDays = Array.isArray(program.trainingDays) ? program.trainingDays.slice(0, 7).filter(plainObject).map((day, dayIndex) => {
+      const ids = [...new Set((Array.isArray(day.exerciseIds) ? day.exerciseIds : []).filter(id => typeof id === 'string' && exerciseNames.has(id)).map(id => id.slice(0, 80)))].slice(0, 20);
+      const specs = Array.isArray(day.exerciseSpecs) ? day.exerciseSpecs.slice(0, 20).filter(spec => plainObject(spec) && ids.includes(spec.exerciseId)).map(spec => ({ exerciseId: String(spec.exerciseId).slice(0, 80), sets: String(spec.sets || '3').slice(0, 12), reps: String(spec.reps || '8–12').slice(0, 20), rest: String(spec.rest || '90 сек').slice(0, 20), weight: String(spec.weight || '').slice(0, 20), note: String(spec.note || '').slice(0, 160) })) : [];
+      return { id: typeof day.id === 'string' && /^[\w-]{1,40}$/.test(day.id) ? day.id : `day-${dayIndex + 1}`, title: String(day.title || `Тренировка ${dayIndex + 1}`).trim().slice(0, 60), isRestDay: day.isRestDay === true, note: String(day.note || '').slice(0, 240), exerciseIds: ids, exerciseSpecs: specs };
+    }) : [];
+    const legacyIds = Array.isArray(program.exerciseIds) ? [...new Set(program.exerciseIds.filter(id => typeof id === 'string' && exerciseNames.has(id)).map(id => id.slice(0, 80)))].slice(0, 60) : [];
+    const exerciseIds = trainingDays.length ? [...new Set(trainingDays.flatMap(day => day.exerciseIds))].slice(0, 60) : legacyIds;
+    const sourceSpecs = Array.isArray(program.exerciseSpecs) ? program.exerciseSpecs : trainingDays[0]?.exerciseSpecs || [];
+    const allowedIds = new Set(exerciseIds);
+    const exerciseSpecs = sourceSpecs.slice(0, 60).filter(spec => plainObject(spec) && allowedIds.has(spec.exerciseId)).map(spec => ({ exerciseId: String(spec.exerciseId).slice(0, 80), sets: String(spec.sets || '3').slice(0, 12), reps: String(spec.reps || '8–12').slice(0, 20), rest: String(spec.rest || '90 сек').slice(0, 20), weight: String(spec.weight || '').slice(0, 20), note: String(spec.note || '').slice(0, 160) }));
+    return {
+      id: typeof program.id === 'string' && /^cp-[0-9a-f-]{36}$/i.test(program.id) ? program.id : '',
+      name: String(program.name || '').trim().slice(0, 60), description: String(program.description || '').trim().slice(0, 240), schedule: typeof program.schedule === 'string' ? program.schedule.slice(0, 80) : '',
+      goal: String(program.goal || '').slice(0, 80), level: String(program.level || '').slice(0, 30), equipment: String(program.equipment || '').slice(0, 40), restrictions: String(program.restrictions || '').slice(0, 240),
+      frequency: Math.min(7, Math.max(1, Number(program.frequency) || trainingDays.filter(day => !day.isRestDay).length || 3)), durationWeeks: [4, 8, 12].includes(Number(program.durationWeeks)) ? Number(program.durationWeeks) : 4,
+      progression: ['linear', 'double', 'manual'].includes(program.progression) ? program.progression : 'manual', notes: String(program.notes || '').slice(0, 500), showWeights: program.showWeights !== false, allowReorder: program.allowReorder !== false,
+      trainingDays, exerciseIds, exerciseSpecs
+    };
+  }).filter(program => program.id && program.name && program.exerciseIds.length) : [];
   const active = input.activeSession;
   const validActive = plainObject(active) && typeof active.id === 'string' && Number.isInteger(active.plan) && active.plan >= 0 && active.plan < 200 && Array.isArray(active.done);
+  const activeExerciseIds = validActive && Array.isArray(active.exerciseIds) ? [...new Set(active.exerciseIds.filter(id => typeof id === 'string' && exerciseNames.has(id)).map(id => id.slice(0, 80)))].slice(0, 60) : [];
+  const activeExerciseOverrides = [];
+  if (validActive && Array.isArray(active.exerciseOverrides)) {
+    const seenExerciseOverrideIndexes = new Set();
+    for (const item of active.exerciseOverrides.slice(0, 60)) {
+      if (!plainObject(item) || !plainObject(item.spec)) continue;
+      const index = Number(item.index), exerciseId = typeof item.exerciseId === 'string' ? item.exerciseId : '', mode = item.spec.mode;
+      if (!Number.isInteger(index) || index < 0 || index >= activeExerciseIds.length || activeExerciseIds[index] !== exerciseId || !exerciseNames.has(exerciseId) || !['duration', 'strength'].includes(mode) || seenExerciseOverrideIndexes.has(index)) continue;
+      seenExerciseOverrideIndexes.add(index);
+      activeExerciseOverrides.push({ index, exerciseId: exerciseId.slice(0, 80), spec: { exerciseId: exerciseId.slice(0, 80), mode, sets: String(item.spec.sets || '').slice(0, 30), reps: String(item.spec.reps || '').slice(0, 30), rest: String(item.spec.rest || '').slice(0, 30), rir: String(item.spec.rir || '').slice(0, 30), weight: String(item.spec.weight || '').slice(0, 30), note: String(item.spec.note || '').slice(0, 160) } });
+    }
+  }
   const weeklySessions = Number(input.targets?.weeklySessions);
   const availableProgramId = id => typeof id === 'string' && (/^\d{2}$/.test(id) || customPrograms.some(program => program.id === id));
   const currentProgramId = availableProgramId(input.programId) ? input.programId : '';
   const completed = plainObject(input.completed) ? input.completed : {};
   const myProgramIds = [...new Set((Array.isArray(input.myProgramIds) ? input.myProgramIds : Array.isArray(completed.__myProgramIds) ? completed.__myProgramIds : [...customPrograms.map(program => program.id), currentProgramId])
     .filter(availableProgramId))].slice(0, 100);
+  const programExerciseReplacements = new Map();
+  for (const item of (Array.isArray(input.programExerciseReplacements) ? input.programExerciseReplacements : []).slice(0, 500)) {
+    if (!plainObject(item)) continue;
+    const programId = typeof item.programId === 'string' ? item.programId : '';
+    const dayIndex = Number(item.dayIndex), exerciseIndex = Number(item.exerciseIndex);
+    const exerciseId = typeof item.exerciseId === 'string' ? item.exerciseId : '';
+    const day = libraryProgramsById.get(programId)?.days?.[dayIndex];
+    const slot = day?.exercises?.[exerciseIndex];
+    if (!myProgramIds.includes(programId) || !Number.isInteger(dayIndex) || !Number.isInteger(exerciseIndex) || !slot || !exerciseNames.has(exerciseId) || slot.exerciseId === exerciseId) continue;
+    const originalTimed = slot.mode === 'duration' || timedExerciseIds.has(String(slot.exerciseId));
+    if (originalTimed !== timedExerciseIds.has(exerciseId)) continue;
+    programExerciseReplacements.set(`${programId}:${dayIndex}:${exerciseIndex}`, { programId, dayIndex, exerciseIndex, exerciseId: exerciseId.slice(0, 80) });
+  }
   const activeProgramId = currentProgramId || myProgramIds[0] || '';
   const programProgress = {};
   if (plainObject(input.programProgress)) {
@@ -251,13 +298,14 @@ function normalizeData(input) {
     appSettings: normalizeAppSettings(input.appSettings),
     bodyMeasurements: normalizeBodyMeasurements(input.bodyMeasurements),
     customPrograms,
+    programExerciseReplacements: [...programExerciseReplacements.values()],
     targets: { weeklySessions: Number.isInteger(weeklySessions) && weeklySessions >= 1 && weeklySessions <= 14 ? weeklySessions : 0 },
     programId: activeProgramId,
     myProgramIds,
     programProgress: plainObject(input.programProgress) ? programProgress : null,
-    week: [1, 2, 3, 4].includes(Number(input.week)) ? Number(input.week) : 1,
+    week: Number.isInteger(Number(input.week)) && Number(input.week) >= 1 && Number(input.week) <= 12 ? Number(input.week) : 1,
     completed: { ...completed, __myProgramIds: myProgramIds.slice() },
-    activeSession: validActive ? { id: active.id.slice(0, 100), plan: active.plan, programId: typeof active.programId === 'string' && customPrograms.some(program => program.id === active.programId) ? active.programId : '', week: [1, 2, 3, 4].includes(Number(active.week)) ? Number(active.week) : 1, startedAt: typeof active.startedAt === 'string' ? active.startedAt.slice(0, 40) : new Date().toISOString(), done: active.done.filter(id => typeof id === 'string').slice(0, 100), exerciseIds: Array.isArray(active.exerciseIds) ? [...new Set(active.exerciseIds.filter(id => typeof id === 'string').map(id => id.slice(0, 80)))].slice(0, 60) : [], restTimer: plainObject(active.restTimer) ? { durationSeconds: Math.min(1800, Math.max(30, Number(active.restTimer.durationSeconds) || 120)), endsAt: typeof active.restTimer.endsAt === 'string' ? active.restTimer.endsAt.slice(0, 40) : '', pausedRemainingSeconds: Math.min(1800, Math.max(0, Number(active.restTimer.pausedRemainingSeconds) || 0)), completedAt: typeof active.restTimer.completedAt === 'string' ? active.restTimer.completedAt.slice(0, 40) : '', notifiedAt: typeof active.restTimer.notifiedAt === 'string' ? active.restTimer.notifiedAt.slice(0, 40) : '' } : null } : null,
+    activeSession: validActive ? { id: active.id.slice(0, 100), plan: active.plan, programId: typeof active.programId === 'string' && customPrograms.some(program => program.id === active.programId) ? active.programId : '', week: Number.isInteger(Number(active.week)) && Number(active.week) >= 1 && Number(active.week) <= 12 ? Number(active.week) : 1, startedAt: typeof active.startedAt === 'string' ? active.startedAt.slice(0, 40) : new Date().toISOString(), done: active.done.filter(id => typeof id === 'string').slice(0, 100), exerciseIds: activeExerciseIds, exerciseOverrides: activeExerciseOverrides, restTimer: plainObject(active.restTimer) ? { durationSeconds: Math.min(1800, Math.max(30, Number(active.restTimer.durationSeconds) || 120)), endsAt: typeof active.restTimer.endsAt === 'string' ? active.restTimer.endsAt.slice(0, 40) : '', pausedRemainingSeconds: Math.min(1800, Math.max(0, Number(active.restTimer.pausedRemainingSeconds) || 0)), completedAt: typeof active.restTimer.completedAt === 'string' ? active.restTimer.completedAt.slice(0, 40) : '', notifiedAt: typeof active.restTimer.notifiedAt === 'string' ? active.restTimer.notifiedAt.slice(0, 40) : '' } : null } : null,
     nutrition: normalizeNutrition(input.nutrition)
   };
 }
@@ -333,10 +381,16 @@ function writeState() {
   return writeQueue;
 }
 async function telegramApi(method, payload = {}) {
-  if (!telegramBotToken) return { ok: false, status: 0 };
+  if (!telegramRelayUrl || !telegramRelaySecret) return { ok: false, status: 0 };
   try {
-    const response = await fetch(`https://api.telegram.org/bot${telegramBotToken}/${method}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(7000)
+    const body = JSON.stringify({ method, payload });
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac('sha256', telegramRelaySecret).update(`${timestamp}.${body}`).digest('hex');
+    const response = await fetch(telegramRelayUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ritm-Timestamp': timestamp, 'X-Ritm-Signature': signature },
+      body,
+      signal: AbortSignal.timeout(9000)
     });
     const result = await response.json().catch(() => null);
     return {
@@ -599,6 +653,35 @@ function coachRelationshipView(link, actorLogin) {
     messages: (Array.isArray(link.messages) ? link.messages : []).slice(-60).map(message => ({ id: message.id, from: message.from, text: message.text, at: message.at })),
     assignments: (role === 'client' || permissions.programs ? (Array.isArray(link.assignments) ? link.assignments : []) : []).slice(-20).map(item => ({ id: item.id, programId: item.programId, programName: programNames.get(item.programId) || '', status: item.status, createdAt: item.createdAt, acceptedAt: item.acceptedAt || null }))
   };
+  if (role === 'trainer' && avatarKeyFor(peerLogin)) result.peer.avatarUrl = `/api/coach/links/${encodeURIComponent(link.id)}/avatar`;
+  result.assignments = result.assignments.map(item => {
+    const stored = (Array.isArray(link.assignments) ? link.assignments : []).find(candidate => candidate.id === item.id);
+    const custom = plainObject(stored?.customProgram) ? stored.customProgram : null;
+    const renderExercises = specs => Array.isArray(specs) ? specs.slice(0, 20).map(spec => ({
+      exerciseId: String(spec.exerciseId || ''),
+      name: exerciseNames.get(String(spec.exerciseId || '')) || 'Упражнение',
+      sets: String(spec.sets || '3').slice(0, 12),
+      reps: String(spec.reps || '8–12').slice(0, 20),
+      rest: String(spec.rest || '90 сек').slice(0, 20),
+      weight: String(spec.weight || '').slice(0, 20),
+      note: String(spec.note || '').slice(0, 160)
+    })) : [];
+    const exercises = custom ? renderExercises(custom.exerciseSpecs) : [];
+    const trainingDays = custom && Array.isArray(custom.trainingDays) ? custom.trainingDays.slice(0, 7).map((day, index) => ({
+      id: String(day.id || `day-${index + 1}`).slice(0, 40), title: String(day.title || `Тренировка ${index + 1}`).slice(0, 60), isRestDay: day.isRestDay === true,
+      note: String(day.note || '').slice(0, 240), exercises: renderExercises(day.exerciseSpecs)
+    })) : [];
+    return {
+      ...item,
+      programName: String(stored?.programName || item.programName || (custom?.name || '')).slice(0, 60),
+      customProgram: custom ? {
+        description: String(custom.description || '').slice(0, 240), goal: String(custom.goal || '').slice(0, 80), level: String(custom.level || '').slice(0, 30),
+        equipment: String(custom.equipment || '').slice(0, 40), restrictions: String(custom.restrictions || '').slice(0, 240), frequency: Number(custom.frequency) || 0,
+        durationWeeks: [4, 8, 12].includes(Number(custom.durationWeeks)) ? Number(custom.durationWeeks) : 4, progression: String(custom.progression || 'manual'), notes: String(custom.notes || '').slice(0, 500),
+        showWeights: custom.showWeights !== false, allowReorder: custom.allowReorder !== false, exercises, trainingDays
+      } : null
+    };
+  });
   result.workoutAssignments = (role === 'client' || permissions.workouts ? (Array.isArray(link.workoutAssignments) ? link.workoutAssignments : []) : []).slice(-20).map(item => ({ id: item.id, title: String(item.title || 'Тренировка').slice(0, 80), date: item.date || '', exerciseIds: Array.isArray(item.exerciseIds) ? item.exerciseIds.slice(0, 20) : [], exerciseNames: Array.isArray(item.exerciseIds) ? item.exerciseIds.slice(0, 20).map(id => exerciseNames.get(String(id)) || '').filter(Boolean) : [], exerciseSpecs: Array.isArray(item.exerciseSpecs) ? item.exerciseSpecs.slice(0, 20) : [], note: String(item.note || '').slice(0, 500), status: item.status, createdAt: item.createdAt, acceptedAt: item.acceptedAt || null, customProgramId: item.customProgramId || '' }));
   result.workoutAssignments = result.workoutAssignments.map(item => {
     const stored = (Array.isArray(link.workoutAssignments) ? link.workoutAssignments : []).find(candidate => candidate.id === item.id);
@@ -617,9 +700,10 @@ function coachRelationshipView(link, actorLogin) {
     result.workouts = {
       count: sessions.length,
       recent: sessions.slice(-5).reverse().map(session => ({
+        sessionId: typeof session.id === 'string' ? session.id.slice(0, 100) : '',
         date: typeof session.date === 'string' ? session.date.slice(0, 40) : '',
         planName: String(session.planName || programNames.get(String(session.plan || '')) || 'Тренировка').slice(0, 80),
-        durationSeconds: boundedNumber(session.durationSeconds ?? session.duration, 86400),
+        durationSeconds: boundedNumber(session.durationSeconds ?? (Number(session.duration) || 0) * 60, 86400),
         exercises: boundedNumber(session.exercises, 100),
         exerciseNames: (Array.isArray(session.exerciseIds) ? session.exerciseIds : []).slice(0, 20).map(id => exerciseNames.get(String(id)) || '').filter(Boolean)
       }))
@@ -722,7 +806,7 @@ async function serveStatic(req, res, pathname) {
   const relative = decoded.replace(/^\/+/, '');
   const target = path.resolve(root, relative);
   const assetRelative = path.relative(assetsRoot, target);
-  const isPublicAsset = decoded.startsWith('/assets/') && assetRelative !== '' && assetRelative !== '..' && !assetRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(assetRelative) && publicAssetExtensions.has(path.extname(target).toLowerCase());
+  const isPublicAsset = decoded.startsWith('/assets/') && assetRelative !== '' && assetRelative !== '..' && !assetRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(assetRelative) && (publicAssetExtensions.has(path.extname(target).toLowerCase()) || publicAssetFiles.has(decoded));
   if (!isPublicFile && !isPublicAsset) return json(res, 404, { error: 'Не найдено' });
   try {
     const [realRoot, realAssetsRoot, realTarget] = await Promise.all([realpath(root), realpath(assetsRoot), realpath(target)]);
@@ -926,6 +1010,22 @@ async function handle(req, res) {
     state.coachApplications = plainObject(state.coachApplications) ? state.coachApplications : {};
     state.coachAudit = Array.isArray(state.coachAudit) ? state.coachAudit : [];
 
+    const coachAvatarMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/avatar$/i);
+    if (coachAvatarMatch && req.method === 'GET') {
+      const link = activeCoachLink(coachAvatarMatch[1]);
+      if (!link || link.trainerLogin !== actor.login || !userHasRole(state.users[actor.login], 'trainer')) return json(res, 404, { error: 'Аватар недоступен' });
+      const key = avatarKeyFor(link.clientLogin);
+      if (!key) return json(res, 404, { error: 'Аватар не установлен' });
+      try {
+        const image = await readFile(path.join(avatarDir, `${key}.jpg`));
+        res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': image.length, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin' });
+        return res.end(image);
+      } catch (error) {
+        if (error.code === 'ENOENT') return json(res, 404, { error: 'Аватар не найден' });
+        throw error;
+      }
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/coach/applications') {
       const application = Object.values(state.coachApplications)
         .filter(item => item?.login === actor.login)
@@ -1049,6 +1149,7 @@ async function handle(req, res) {
     const noteMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/note$/i);
     const permissionMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/permissions$/i);
     const assignmentMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/assignments$/i);
+    const workoutDetailMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/workouts\/([A-Za-z0-9_-]{1,100})$/i);
     const acceptAssignmentMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/assignments\/([0-9a-f-]{36})\/accept$/i);
     const declineAssignmentMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/assignments\/([0-9a-f-]{36})\/decline$/i);
     const workoutAssignmentMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/workout-assignments$/i);
@@ -1057,6 +1158,38 @@ async function handle(req, res) {
     const messageMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/messages$/i);
     const recommendationMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/recommendations(?:\/([0-9a-f-]{36})\/ack)?$/i);
     const nutritionGoalMatch = url.pathname.match(/^\/api\/coach\/links\/([0-9a-f-]{36})\/nutrition-goals(?:\/([0-9a-f-]{36})\/(accept|decline))?$/i);
+    if (workoutDetailMatch && req.method === 'GET') {
+      const link = activeCoachLink(workoutDetailMatch[1]);
+      if (!link || link.trainerLogin !== actor.login || !userHasRole(state.users[actor.login], 'trainer') || link.permissions?.workouts !== true) return json(res, 404, { error: 'Тренировка недоступна' });
+      const clientData = state.users[link.clientLogin]?.data;
+      const sessionId = workoutDetailMatch[2];
+      const session = Array.isArray(clientData?.sessions) ? clientData.sessions.find(item => item?.id === sessionId) : null;
+      if (!session) return json(res, 404, { error: 'Тренировка не найдена' });
+      const listedIds = Array.isArray(session.exerciseIds) ? session.exerciseIds : [];
+      const derivedIds = Object.entries(plainObject(clientData.entries) ? clientData.entries : {})
+        .filter(([, entries]) => Array.isArray(entries) && entries.some(entry => entry?.sessionId === sessionId))
+        .map(([exerciseId]) => exerciseId);
+      const exerciseIds = [...new Set([...listedIds, ...derivedIds].filter(id => typeof id === 'string' && exerciseNames.has(id)))].slice(0, 60);
+      const exercises = exerciseIds.map(exerciseId => {
+        const entries = Array.isArray(clientData.entries?.[exerciseId]) ? clientData.entries[exerciseId] : [];
+        const sets = entries.filter(entry => entry?.sessionId === sessionId).slice(-100).map(entry => ({
+          mode: entry.mode === 'duration' ? 'duration' : 'strength',
+          weight: entry.weight === '' || entry.weight == null ? '' : String(entry.weight).slice(0, 20),
+          reps: Number.isFinite(Number(entry.reps)) ? Math.max(0, Math.min(500, Number(entry.reps))) : null,
+          seconds: Number.isFinite(Number(entry.seconds)) ? Math.max(0, Math.min(86400, Number(entry.seconds))) : null,
+          date: typeof entry.date === 'string' ? entry.date.slice(0, 40) : ''
+        }));
+        return { exerciseId, name: exerciseNames.get(exerciseId), sets };
+      });
+      return json(res, 200, { session: {
+        id: sessionId,
+        planName: String(session.planName || programNames.get(String(session.plan || '')) || 'Тренировка').slice(0, 80),
+        date: typeof session.date === 'string' ? session.date.slice(0, 40) : '',
+        durationSeconds: boundedNumber(session.durationSeconds ?? (Number(session.duration) || 0) * 60, 86400),
+        exerciseCount: boundedNumber(session.exercises ?? exerciseIds.length, 100),
+        exercises
+      } });
+    }
     if (linkMatch && req.method === 'DELETE') {
       const link = activeCoachLink(linkMatch[1]);
       if (!link || !coachPeer(link, actor.login)) return json(res, 404, { error: 'Связь не найдена' });
@@ -1094,31 +1227,99 @@ async function handle(req, res) {
       if (!link || link.trainerLogin !== actor.login || link.permissions?.programs !== true) return json(res, 403, { error: 'Клиент не разрешил назначать программы' });
       const body = await readBody(req);
       const programId = typeof body?.programId === 'string' ? body.programId : '';
-      if (!programNames.has(programId)) return json(res, 400, { error: 'Выбери программу из каталога' });
+      let customProgram = null, programName = '';
+      if (plainObject(body?.customProgram)) {
+        const candidate = body.customProgram;
+        const name = typeof candidate.name === 'string' ? candidate.name.trim().replace(/\s+/g, ' ').slice(0, 60) : '';
+        const description = typeof candidate.description === 'string' ? candidate.description.trim().slice(0, 240) : '';
+        const rawDays = Array.isArray(candidate.trainingDays) ? candidate.trainingDays : [];
+        const daysToValidate = rawDays.length ? rawDays : [{ id: 'day-1', title: 'Тренировка 1', exerciseIds: candidate.exerciseIds, exerciseSpecs: candidate.exerciseSpecs }];
+        if (programId || name.length < 2 || !daysToValidate.length || daysToValidate.length > 7) return json(res, 400, { error: 'Проверь название программы и добавь от 1 до 7 тренировочных дней.' });
+        let invalidDays = false, exerciseSlots = 0;
+        const trainingDays = daysToValidate.map((day, dayIndex) => {
+          const rawIds = Array.isArray(day.exerciseIds) ? day.exerciseIds : [];
+          const exerciseIds = [...new Set(rawIds.filter(id => typeof id === 'string' && exerciseNames.has(id)))].slice(0, 20);
+          exerciseSlots += exerciseIds.length;
+          if (rawIds.length !== exerciseIds.length || (!day.isRestDay && !exerciseIds.length)) invalidDays = true;
+          const rawSpecs = Array.isArray(day.exerciseSpecs) ? day.exerciseSpecs : [];
+          const exerciseSpecs = exerciseIds.map(exerciseId => {
+            const spec = rawSpecs.find(item => item?.exerciseId === exerciseId);
+            const sets = Number(spec?.sets), reps = typeof spec?.reps === 'string' ? spec.reps.trim().slice(0, 20) : '', rest = typeof spec?.rest === 'string' ? spec.rest.trim().slice(0, 20) : '';
+            const weight = typeof spec?.weight === 'string' ? spec.weight.trim().slice(0, 20) : '', note = typeof spec?.note === 'string' ? spec.note.trim().slice(0, 160) : '';
+            if (!Number.isInteger(sets) || sets < 1 || sets > 20 || !reps || !rest) return null;
+            return { exerciseId, sets: String(sets), reps, rest, weight, note };
+          });
+          if (exerciseSpecs.some(spec => !spec)) invalidDays = true;
+          return { id: typeof day.id === 'string' && /^[\w-]{1,40}$/.test(day.id) ? day.id : `day-${dayIndex + 1}`, title: String(day.title || `Тренировка ${dayIndex + 1}`).trim().replace(/\s+/g, ' ').slice(0, 60), isRestDay: day.isRestDay === true, note: String(day.note || '').trim().slice(0, 240), exerciseIds, exerciseSpecs };
+        });
+        const workingDays = trainingDays.filter(day => !day.isRestDay);
+        const exerciseIds = [...new Set(trainingDays.flatMap(day => day.exerciseIds))];
+        if (exerciseSlots > 60 || !workingDays.length || !exerciseIds.length || invalidDays || trainingDays.some(day => day.title.length < 2)) return json(res, 400, { error: 'Проверь тренировки: в каждой рабочей тренировке должно быть упражнение с корректными параметрами.' });
+        const durationWeeks = [4, 8, 12].includes(Number(candidate.durationWeeks)) ? Number(candidate.durationWeeks) : 4;
+        const firstWorkout = workingDays[0];
+        customProgram = {
+          name, description, exerciseIds, exerciseSpecs: firstWorkout.exerciseSpecs, trainingDays,
+          goal: String(candidate.goal || '').trim().slice(0, 80), level: ['Новичок', 'Средний', 'Продвинутый'].includes(candidate.level) ? candidate.level : 'Средний',
+          equipment: ['Зал', 'Дом', 'Смешанное'].includes(candidate.equipment) ? candidate.equipment : 'Зал', restrictions: String(candidate.restrictions || '').trim().slice(0, 240),
+          frequency: Math.min(7, Math.max(1, Number(candidate.frequency) || workingDays.length)), durationWeeks,
+          progression: ['linear', 'double', 'manual'].includes(candidate.progression) ? candidate.progression : 'manual', notes: String(candidate.notes || '').trim().slice(0, 500),
+          showWeights: candidate.showWeights !== false, allowReorder: candidate.allowReorder !== false
+        };
+        programName = name;
+      } else {
+        if (!programNames.has(programId)) return json(res, 400, { error: 'Выбери программу из каталога' });
+        programName = programNames.get(programId);
+      }
       link.assignments = Array.isArray(link.assignments) ? link.assignments : [];
       if (link.assignments.filter(item => item.status === 'pending').length >= 10) return json(res, 409, { error: 'Слишком много ожидающих назначений' });
-      const assignment = { id: randomUUID(), programId, status: 'pending', createdAt: new Date().toISOString() };
+      const assignment = { id: randomUUID(), programId: programId || '', programName, ...(customProgram ? { customProgram } : {}), status: 'pending', createdAt: new Date().toISOString() };
       link.assignments.push(assignment);
-      addNotification(link.clientLogin, 'program-assignment', 'Тренер предложил программу', `Нужно принять или отклонить программу «${programNames.get(programId)}».`, 'coach');
+      addNotification(link.clientLogin, 'program-assignment', 'Тренер предложил программу', `Нужно принять или отклонить программу «${programName}».`, 'coach');
       await logCoachAction(actor.login, 'program:assign', link.id);
-      return json(res, 201, { assignment: { ...assignment, programName: programNames.get(programId) } });
+      return json(res, 201, { assignment: { id: assignment.id, programId: assignment.programId, programName, status: assignment.status, createdAt: assignment.createdAt } });
     }
     if (acceptAssignmentMatch && req.method === 'POST') {
       const link = activeCoachLink(acceptAssignmentMatch[1]);
       if (!link || link.clientLogin !== actor.login) return json(res, 404, { error: 'Связь не найдена' });
+      if (link.permissions?.programs !== true) return json(res, 403, { error: 'Доступ к программам отозван.' });
       const assignment = (link.assignments || []).find(item => item.id === acceptAssignmentMatch[2] && item.status === 'pending');
       if (!assignment) return json(res, 404, { error: 'Назначение не найдено или уже обработано' });
       const data = state.users[actor.login].data;
       data.myProgramIds = Array.isArray(data.myProgramIds) ? data.myProgramIds : [];
-      if (!data.myProgramIds.includes(assignment.programId)) data.myProgramIds.push(assignment.programId);
+      let acceptedProgramId = assignment.programId;
+      if (plainObject(assignment.customProgram)) {
+        data.customPrograms = Array.isArray(data.customPrograms) ? data.customPrograms : [];
+        if (data.customPrograms.length >= 100 || data.myProgramIds.length >= 100) return json(res, 409, { error: 'Список программ заполнен. Убери одну программу перед принятием.' });
+        const custom = assignment.customProgram;
+        acceptedProgramId = `cp-${randomUUID()}`;
+        data.customPrograms.push({
+          id: acceptedProgramId,
+          name: String(custom.name || assignment.programName || 'Программа').slice(0, 60),
+          description: String(custom.description || 'План от тренера.').slice(0, 240),
+          schedule: '',
+          exerciseIds: (Array.isArray(custom.exerciseIds) ? custom.exerciseIds : []).slice(0, 60),
+          exerciseSpecs: (Array.isArray(custom.exerciseSpecs) ? custom.exerciseSpecs : []).slice(0, 60).map(spec => ({ exerciseId: String(spec.exerciseId || '').slice(0, 80), sets: String(spec.sets || '3').slice(0, 12), reps: String(spec.reps || '8–12').slice(0, 20), rest: String(spec.rest || '90 сек').slice(0, 20), weight: String(spec.weight || '').slice(0, 20), note: String(spec.note || '').slice(0, 160) })),
+          trainingDays: Array.isArray(custom.trainingDays) ? custom.trainingDays.slice(0, 7).map((day, index) => ({ id: String(day.id || `day-${index + 1}`).slice(0, 40), title: String(day.title || `Тренировка ${index + 1}`).slice(0, 60), isRestDay: day.isRestDay === true, note: String(day.note || '').slice(0, 240), exerciseIds: (Array.isArray(day.exerciseIds) ? day.exerciseIds : []).slice(0, 20), exerciseSpecs: (Array.isArray(day.exerciseSpecs) ? day.exerciseSpecs : []).slice(0, 20).map(spec => ({ exerciseId: String(spec.exerciseId || '').slice(0, 80), sets: String(spec.sets || '3').slice(0, 12), reps: String(spec.reps || '8–12').slice(0, 20), rest: String(spec.rest || '90 сек').slice(0, 20), weight: String(spec.weight || '').slice(0, 20), note: String(spec.note || '').slice(0, 160) })) })) : [],
+          goal: String(custom.goal || '').slice(0, 80), level: String(custom.level || '').slice(0, 30), equipment: String(custom.equipment || '').slice(0, 40), restrictions: String(custom.restrictions || '').slice(0, 240),
+          frequency: Math.min(7, Math.max(1, Number(custom.frequency) || 3)), durationWeeks: [4, 8, 12].includes(Number(custom.durationWeeks)) ? Number(custom.durationWeeks) : 4,
+          progression: ['linear', 'double', 'manual'].includes(custom.progression) ? custom.progression : 'manual', notes: String(custom.notes || '').slice(0, 500), showWeights: custom.showWeights !== false, allowReorder: custom.allowReorder !== false
+        });
+        data.customPrograms = data.customPrograms.slice(-100);
+      } else if (!programNames.has(acceptedProgramId)) {
+        return json(res, 409, { error: 'Предложенная программа больше недоступна.' });
+      }
+      if (!data.myProgramIds.includes(acceptedProgramId) && data.myProgramIds.length >= 100) return json(res, 409, { error: 'Список программ заполнен. Убери одну программу перед принятием.' });
+      if (!data.myProgramIds.includes(acceptedProgramId)) data.myProgramIds.push(acceptedProgramId);
+      data.myProgramIds = [...new Set(data.myProgramIds)];
       data.completed = plainObject(data.completed) ? data.completed : {};
       data.completed.__myProgramIds = data.myProgramIds.slice();
       bumpDataRevision(actor.login);
       assignment.status = 'accepted';
       assignment.acceptedAt = new Date().toISOString();
-      addNotification(link.trainerLogin, 'program-decision', 'Подопечный принял программу', `Пользователь @${actor.login} добавил предложенную программу.`, 'coach');
+      assignment.acceptedProgramId = acceptedProgramId;
+      addNotification(link.trainerLogin, 'program-decision', 'Подопечный принял программу', `Пользователь @${actor.login} добавил предложенную программу «${String(assignment.programName || 'Программа').slice(0, 60)}».`, 'coach');
       await logCoachAction(actor.login, 'program:accept', link.id);
-      return json(res, 200, { ok: true, programId: assignment.programId });
+      return json(res, 200, { ok: true, programId: acceptedProgramId });
     }
     if (declineAssignmentMatch && req.method === 'POST') {
       const link = activeCoachLink(declineAssignmentMatch[1]);
@@ -1729,9 +1930,29 @@ try {
   const librarySource = await readFile(path.join(root, 'program-library.js'), 'utf8');
   const libraryJson = librarySource.slice(librarySource.indexOf('=') + 1).trim().replace(/;\s*$/, '');
   const library = JSON.parse(libraryJson);
+  libraryProgramsById = new Map((Array.isArray(library.programs) ? library.programs : []).filter(program => program && typeof program.id === 'string').map(program => [String(program.id), program]));
   for (const exercise of Array.isArray(library.exercises) ? library.exercises : []) exerciseNames.set(String(exercise.id), String(exercise.name));
+  for (const [id, program] of libraryProgramsById) {
+    if (typeof program.name === 'string') programNames.set(id, program.name);
+    for (const day of Array.isArray(program.days) ? program.days : []) {
+      for (const spec of Array.isArray(day.exercises) ? day.exercises : []) if (spec.mode === 'duration') timedExerciseIds.add(String(spec.exerciseId));
+    }
+  }
 } catch (error) {
   console.error(`Не удалось прочитать названия упражнений для аналитики: ${error.message}`);
+}
+try {
+  const techniqueWindow = {};
+  const techniqueSource = await readFile(path.join(root, 'exercise-techniques.js'), 'utf8');
+  runInNewContext(techniqueSource, { window: techniqueWindow }, { timeout: 1000 });
+  const techniques = techniqueWindow.RITM_EXERCISE_TECHNIQUES;
+  for (const exercise of Array.isArray(techniques?.additions) ? techniques.additions : []) {
+    if (typeof exercise.id !== 'string' || typeof exercise.name !== 'string') continue;
+    exerciseNames.set(exercise.id, exercise.name);
+    if (exercise.warmup === true) timedExerciseIds.add(exercise.id);
+  }
+} catch (error) {
+  console.error(`Не удалось прочитать дополнительные упражнения: ${error.message}`);
 }
 try {
   const catalog = JSON.parse(await readFile(nutritionCatalogFile, 'utf8'));
