@@ -246,6 +246,18 @@ function normalizeData(input) {
   }).filter(program => program.id && program.name && program.exerciseIds.length) : [];
   const active = input.activeSession;
   const validActive = plainObject(active) && typeof active.id === 'string' && Number.isInteger(active.plan) && active.plan >= 0 && active.plan < 200 && Array.isArray(active.done);
+  const activeExerciseIds = validActive && Array.isArray(active.exerciseIds) ? [...new Set(active.exerciseIds.filter(id => typeof id === 'string' && exerciseNames.has(id)).map(id => id.slice(0, 80)))].slice(0, 60) : [];
+  const activeExerciseOverrides = [];
+  if (validActive && Array.isArray(active.exerciseOverrides)) {
+    const seenExerciseOverrideIndexes = new Set();
+    for (const item of active.exerciseOverrides.slice(0, 60)) {
+      if (!plainObject(item) || !plainObject(item.spec)) continue;
+      const index = Number(item.index), exerciseId = typeof item.exerciseId === 'string' ? item.exerciseId : '', mode = item.spec.mode;
+      if (!Number.isInteger(index) || index < 0 || index >= activeExerciseIds.length || activeExerciseIds[index] !== exerciseId || !exerciseNames.has(exerciseId) || !['duration', 'strength'].includes(mode) || seenExerciseOverrideIndexes.has(index)) continue;
+      seenExerciseOverrideIndexes.add(index);
+      activeExerciseOverrides.push({ index, exerciseId: exerciseId.slice(0, 80), spec: { exerciseId: exerciseId.slice(0, 80), mode, sets: String(item.spec.sets || '').slice(0, 30), reps: String(item.spec.reps || '').slice(0, 30), rest: String(item.spec.rest || '').slice(0, 30), rir: String(item.spec.rir || '').slice(0, 30), weight: String(item.spec.weight || '').slice(0, 30), note: String(item.spec.note || '').slice(0, 160) } });
+    }
+  }
   const weeklySessions = Number(input.targets?.weeklySessions);
   const availableProgramId = id => typeof id === 'string' && (/^\d{2}$/.test(id) || customPrograms.some(program => program.id === id));
   const currentProgramId = availableProgramId(input.programId) ? input.programId : '';
@@ -293,7 +305,7 @@ function normalizeData(input) {
     programProgress: plainObject(input.programProgress) ? programProgress : null,
     week: Number.isInteger(Number(input.week)) && Number(input.week) >= 1 && Number(input.week) <= 12 ? Number(input.week) : 1,
     completed: { ...completed, __myProgramIds: myProgramIds.slice() },
-    activeSession: validActive ? { id: active.id.slice(0, 100), plan: active.plan, programId: typeof active.programId === 'string' && customPrograms.some(program => program.id === active.programId) ? active.programId : '', week: Number.isInteger(Number(active.week)) && Number(active.week) >= 1 && Number(active.week) <= 12 ? Number(active.week) : 1, startedAt: typeof active.startedAt === 'string' ? active.startedAt.slice(0, 40) : new Date().toISOString(), done: active.done.filter(id => typeof id === 'string').slice(0, 100), exerciseIds: Array.isArray(active.exerciseIds) ? [...new Set(active.exerciseIds.filter(id => typeof id === 'string').map(id => id.slice(0, 80)))].slice(0, 60) : [], restTimer: plainObject(active.restTimer) ? { durationSeconds: Math.min(1800, Math.max(30, Number(active.restTimer.durationSeconds) || 120)), endsAt: typeof active.restTimer.endsAt === 'string' ? active.restTimer.endsAt.slice(0, 40) : '', pausedRemainingSeconds: Math.min(1800, Math.max(0, Number(active.restTimer.pausedRemainingSeconds) || 0)), completedAt: typeof active.restTimer.completedAt === 'string' ? active.restTimer.completedAt.slice(0, 40) : '', notifiedAt: typeof active.restTimer.notifiedAt === 'string' ? active.restTimer.notifiedAt.slice(0, 40) : '' } : null } : null,
+    activeSession: validActive ? { id: active.id.slice(0, 100), plan: active.plan, programId: typeof active.programId === 'string' && customPrograms.some(program => program.id === active.programId) ? active.programId : '', week: Number.isInteger(Number(active.week)) && Number(active.week) >= 1 && Number(active.week) <= 12 ? Number(active.week) : 1, startedAt: typeof active.startedAt === 'string' ? active.startedAt.slice(0, 40) : new Date().toISOString(), done: active.done.filter(id => typeof id === 'string').slice(0, 100), exerciseIds: activeExerciseIds, exerciseOverrides: activeExerciseOverrides, restTimer: plainObject(active.restTimer) ? { durationSeconds: Math.min(1800, Math.max(30, Number(active.restTimer.durationSeconds) || 120)), endsAt: typeof active.restTimer.endsAt === 'string' ? active.restTimer.endsAt.slice(0, 40) : '', pausedRemainingSeconds: Math.min(1800, Math.max(0, Number(active.restTimer.pausedRemainingSeconds) || 0)), completedAt: typeof active.restTimer.completedAt === 'string' ? active.restTimer.completedAt.slice(0, 40) : '', notifiedAt: typeof active.restTimer.notifiedAt === 'string' ? active.restTimer.notifiedAt.slice(0, 40) : '' } : null } : null,
     nutrition: normalizeNutrition(input.nutrition)
   };
 }
